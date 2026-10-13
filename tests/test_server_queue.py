@@ -72,6 +72,32 @@ def test_a_failed_decision_releases_the_lock(client: TestClient, monkeypatch: py
     assert server.service.lock.acquire(blocking=False)
 
 
+def test_work_always_runs_on_the_one_dedicated_model_thread() -> None:
+    """locked()'s own wait-for-the-lock can happen on any caller thread (run_in_threadpool may hand a burst of
+    requests to several, including brand-new ones), but the actual work must always land on the same thread. A fresh
+    thread's first GPU use pays a real PyTorch/ROCm setup cost, long enough to blow JEFF_QUEUE_MS on an otherwise
+    idle model (see _model_executor's comment in server.py)."""
+    seen: list[str] = []
+
+    def work() -> str:
+        seen.append(threading.current_thread().name)
+        return "ok"
+
+    results: list[str] = []
+
+    def call_locked() -> None:
+        results.append(server.locked(5, work))
+
+    for _ in range(5):  # one at a time: proves thread *identity* is stable, not just mutual exclusion
+        t = threading.Thread(target=call_locked)
+        t.start()
+        t.join()
+
+    assert results == ["ok"] * 5
+    assert len(set(seen)) == 1, f"work() ran on {len(set(seen))} different threads: {seen}"
+    assert seen[0].startswith("jeff-model")
+
+
 def test_the_queue_time_comes_from_jeff_queue_ms() -> None:
     assert server.queue_seconds(None) == 0
     assert server.queue_seconds("0") == 0

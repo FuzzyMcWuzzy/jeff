@@ -23,6 +23,7 @@ import time
 import uuid
 from _thread import LockType
 from collections.abc import AsyncIterator, Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -98,14 +99,23 @@ def queue_seconds(value: str | None) -> float:
     return int(value) / 1000
 
 
+# The actual model work always runs here: one persistent thread, warmed up once at startup (_warm_up). Under
+# concurrent load, run_in_threadpool's own pool can spin up a brand-new thread for a burst of requests; PyTorch/ROCm
+# pay a real per-thread setup cost (BLAS handle, workspace, kernels) on that thread's first GPU use, long enough to
+# blow JEFF_QUEUE_MS and answer 529 to requests that arrive at a perfectly idle model. Keeping the GPU work on one
+# thread that is always warm avoids that, whichever thread happened to pick up the request and wait for the lock.
+_model_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jeff-model")
+
+
 def locked[T](timeout: float, work: Callable[[], T]) -> T:
     """Run `work` holding the model lock, waiting up to `timeout` seconds for it (-1: as long as it takes); raise Busy
-    when the wait runs out. Run in the thread pool: waiting, working and releasing happen in one thread, so a request
-    cancelled while it waits can never leave the lock held."""
+    when the wait runs out. Run in the thread pool: waiting and releasing happen in one thread, so a request
+    cancelled while it waits can never leave the lock held. `work` itself runs on `_model_executor`'s dedicated
+    thread (see its comment), not on whichever thread waited for the lock."""
     if not service.lock.acquire(timeout=timeout):
         raise Busy
     try:
-        return work()
+        return _model_executor.submit(work).result()
     finally:
         service.lock.release()
 
@@ -303,6 +313,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await run_in_threadpool(sync_adapters)
     modified = config_path.stat().st_mtime
     service.release_date = datetime.fromtimestamp(modified, timezone.utc).date().isoformat()
+    await run_in_threadpool(_warm_up)
     try:
         yield
     finally:
@@ -396,6 +407,17 @@ def predict(model: DecisionModel, body: EvaluationRequest) -> DecisionResponse:
                                   for (identifier, question), probabilities in zip(questions.items(), values, strict=True)}
     return {"model": name, "answers": answers,
             "usage": {"input_tokens": input_tokens, "output_tokens": 0, "orders": body.orders}}
+
+
+def _warm_up() -> None:
+    """One trivial decision per served model (the base, plus each adapter) on `_model_executor`'s thread, run once at
+    startup so the real per-thread PyTorch/ROCm GPU setup cost (seen as an 11 s first request) lands here instead of
+    against a live request's JEFF_MAX_LATENCY_MS budget."""
+    assert service.model is not None
+    names = [service.merged] if service.merged else [service.name, *sorted(service.adapters)]
+    for name in names:
+        request = EvaluationRequest(model=cast(str, name), state="warm-up", questions={"q": Noul(type="noul")})
+        locked(-1, lambda request=request: predict(cast("DecisionModel", service.model), request))
 
 
 @app.post("/v1/systemone", dependencies=[Depends(authenticate)], response_model=None)
